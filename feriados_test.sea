@@ -1,0 +1,171 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- feriados: Páscoa, os nacionais (e a história), os pontos facultativos, o
+-- calendário dos bancos, os estaduais com as regras móveis, a capital
+-- paulista, os extras e os dias úteis
+
+local t = require("sea/test")
+local feriados = require("./feriados")
+
+local function dates(list_)
+    return list.map(list_, function(h) return h.date end)
+end
+
+local function names_on(date, opts)
+    return list.map(feriados.holidays(date, opts), function(h) return h.name end)
+end
+
+t.describe("feriados", function()
+    t.it("calcula a Páscoa", function()
+        t.eq(feriados.easter(2000), "2000-04-23")
+        t.eq(feriados.easter(2019), "2019-04-21")
+        t.eq(feriados.easter(2024), "2024-03-31")
+        t.eq(feriados.easter(2025), "2025-04-20")
+        t.eq(feriados.easter(2026), "2026-04-05")
+        t.eq(feriados.easter(2038), "2038-04-25")
+        t.eq(feriados.easter(1961), "1961-04-02")
+    end)
+
+    t.it("traz os feriados nacionais do ano", function()
+        local y = feriados.year(2026)
+        t.eq(dates(y), [
+            "2026-01-01", "2026-04-03", "2026-04-21", "2026-05-01", "2026-09-07", "2026-10-12",
+            "2026-11-02", "2026-11-15", "2026-11-20", "2026-12-25",
+        ])
+        t.eq(y[1].name, "Sexta-feira Santa")
+        t.eq(y[1].kind, "nacional")
+        t.eq(y[1].scope, "BR")
+        -- a Consciência Negra é nacional desde 2024 (Lei 14.759/2023)
+        t.no(feriados.is_holiday("2023-11-20"))
+        t.ok(feriados.is_holiday("2024-11-20"))
+        -- e a história: Nossa Senhora Aparecida desde 1980, o Descobrimento da América antes
+        t.eq(feriados.holiday("1979-10-12"), nil)
+        t.eq(feriados.holiday("1940-10-12").name, "Descobrimento da América")
+        t.eq(feriados.holiday("1920-02-24").name, "Constituição da República")
+        t.eq(len(feriados.year(1950)), 8)
+        t.eq(len(feriados.year(1940)), 10)
+    end)
+
+    t.it("traz os pontos facultativos quando pedidos", function()
+        t.no(feriados.is_holiday("2026-02-17"))
+        local y = feriados.year(2026, {optional = true})
+        local f = list.filter(y, function(h) return h.kind == "facultativo" end)
+        t.eq(dates(f), ["2026-02-16", "2026-02-17", "2026-02-18", "2026-06-04", "2026-10-28", "2026-12-24", "2026-12-31"])
+        t.eq(f[2].name, "Quarta-feira de Cinzas")
+    end)
+
+    t.it("segue o calendário dos bancos: Carnaval e Corpus Christi", function()
+        local bank = {calendar = "bank"}
+        local b = list.filter(feriados.year(2026, bank), function(h) return h.kind == "bancario" end)
+        t.eq(dates(b), ["2026-02-16", "2026-02-17", "2026-06-04"])
+        t.no(feriados.is_business_day("2026-02-16", bank))
+        t.ok(feriados.is_business_day("2026-02-18", bank))
+        t.eq(feriados.next_business_day("2026-02-14", bank), "2026-02-18")
+        -- só os nacionais e os dos bancos: nada de ponto facultativo
+        t.ok(feriados.is_business_day("2026-10-28", bank))
+        t.eq(len(feriados.year(2026, bank)), 13)
+    end)
+
+    t.it("traz os feriados estaduais, com as regras móveis", function()
+        t.eq(feriados.holiday("2026-07-09", {state = "SP"}).name, "Revolução Constitucionalista")
+        t.eq(feriados.holiday("2026-07-09", {state = "SP"}).kind, "estadual")
+        t.eq(feriados.holiday("2026-07-09", {state = "SP"}).scope, "SP")
+        t.eq(feriados.holiday("2026-07-09"), nil)
+        -- pelo nome também
+        t.eq(feriados.holiday("2026-09-20", {state = "Rio Grande do Sul"}).name, "Dia do Gaúcho")
+        t.eq(feriados.holiday("2026-07-02", {state = "bahia"}).name, "Independência da Bahia")
+        -- RJ: São Jorge e a terça de Carnaval
+        t.eq(feriados.holiday("2026-04-23", {state = "RJ"}).name, "São Jorge")
+        t.eq(feriados.holiday("2026-02-17", {state = "RJ"}).name, "Carnaval")
+        -- Acre: na terça, quarta ou quinta, vai para a sexta (desde 2009)
+        t.eq(names_on("2026-11-20", {state = "AC"}), [
+            "Dia Nacional de Zumbi e da Consciência Negra",
+            "Assinatura do Tratado de Petrópolis",
+        ])
+        t.no(feriados.is_holiday("2026-11-17", {state = "AC"}))
+        t.ok(feriados.is_holiday("2008-11-17", {state = "AC"}))
+        -- Santa Catarina: no primeiro domingo a partir do dia
+        t.eq(feriados.holiday("2026-08-16", {state = "SC"}).name, "Dia do Estado de Santa Catarina")
+        t.eq(feriados.holiday("2026-11-29", {state = "SC"}).name, "Dia de Santa Catarina de Alexandria")
+        -- Espírito Santo: oito dias depois da Páscoa (desde 2020)
+        t.eq(feriados.holiday("2026-04-13", {state = "ES"}).name, "Nossa Senhora da Penha")
+        t.no(feriados.is_holiday("2019-04-29", {state = "ES"}))
+        -- Pernambuco: o primeiro domingo de março até 2017, depois 6 de março
+        t.ok(feriados.is_holiday("2017-03-05", {state = "PE"}))
+        t.ok(feriados.is_holiday("2026-03-06", {state = "PE"}))
+        -- Paraná trocou a Emancipação pelo Rocio em 2014
+        t.ok(feriados.is_holiday("2013-12-19", {state = "PR"}))
+        t.no(feriados.is_holiday("2014-12-19", {state = "PR"}))
+        -- Consciência Negra estadual até 2023 (depois, nacional)
+        t.eq(feriados.holiday("2023-11-20", {state = "RJ"}).kind, "estadual")
+        t.eq(feriados.holiday("2024-11-20", {state = "RJ"}).kind, "nacional")
+        -- os estaduais valem desde 1996 (Lei 9.093/1995)
+        t.no(feriados.is_holiday("1995-09-20", {state = "RS"}))
+        -- todas as UFs têm regras
+        for uf, _ in feriados.STATES do
+            t.ok(len(feriados.year(2026, {state = uf})) >= 10, uf)
+        end
+    end)
+
+    t.it("traz os da capital paulista", function()
+        local sp = {city = "São Paulo"}
+        t.eq(feriados.holiday("2026-01-25", sp).name, "Aniversário da Cidade de São Paulo")
+        t.eq(feriados.holiday("2026-01-25", sp).kind, "municipal")
+        t.eq(feriados.holiday("2026-06-04", sp).name, "Corpus Christi")
+        t.eq(feriados.holiday("2026-07-09", sp).name, "Revolução Constitucionalista")
+        t.eq(feriados.cities(), ["São Paulo"])
+        t.not_nil(feriados.calendar({city = "Curitiba"}).message)
+        t.not_nil(feriados.calendar({city = "São Paulo", state = "RJ"}).message)
+    end)
+
+    t.it("aceita outros feriados: os do município, uma folga da empresa", function()
+        local opts = {
+            state = "PR", extra = [
+                {date = "09-08", name = "Nossa Senhora da Luz dos Pinhais"},
+                {date = "2026-12-24", name = "Folga da empresa"},
+                {date = "03-29", name = "Aniversário de Curitiba", since = 2030},
+            ],
+        }
+        t.eq(feriados.holiday("2026-09-08", opts).name, "Nossa Senhora da Luz dos Pinhais")
+        t.eq(feriados.holiday("2026-09-08", opts).kind, "extra")
+        t.ok(feriados.is_holiday("2027-09-08", opts))
+        t.ok(feriados.is_holiday("2026-12-24", opts))
+        t.no(feriados.is_holiday("2027-12-24", opts))
+        t.no(feriados.is_holiday("2026-03-29", opts))
+        -- ou uma função do ano
+        local f = {extra = function(y) return [{date = `${y}-08-15`, name = "Padroeira"}] end}
+        t.ok(feriados.is_holiday("2031-08-15", f))
+    end)
+
+    t.it("conta os dias úteis", function()
+        t.eq(feriados.weekday("2026-01-01"), 4)
+        t.no(feriados.is_business_day("2026-01-03"))
+        t.ok(feriados.is_business_day("2026-01-02"))
+        t.eq(feriados.next_business_day("2026-04-03"), "2026-04-06")
+        t.eq(feriados.next_business_day("2026-04-06"), "2026-04-06")
+        t.eq(feriados.previous_business_day("2026-04-05"), "2026-04-02")
+        t.eq(feriados.add_business_days("2026-12-23", 2), "2026-12-28")
+        t.eq(feriados.add_business_days("2026-12-28", -2), "2026-12-23")
+        t.eq(feriados.add_business_days("2026-04-03", 0), "2026-04-03")
+        t.eq(feriados.business_days_between("2026-01-01", "2026-01-31"), 21)
+        t.eq(feriados.business_days_between("2026-01-31", "2026-01-01"), -21)
+        t.eq(feriados.business_days_between("2026-01-05", "2026-01-09"), 4)
+        -- com o estado: São Jorge no Rio
+        t.eq(feriados.next_business_day("2026-04-23", {state = "RJ"}), "2026-04-24")
+        -- e com um Time de sea
+        t.ok(feriados.is_holiday(time.date(2026, 12, 25, "UTC")))
+        -- um calendário guardado responde igual
+        local cal = feriados.calendar({state = "SP"})
+        t.no(cal:is_business_day("2026-07-09"))
+        t.eq(len(cal:year(2026)), 11)
+        t.eq(cal:add_business_days("2026-07-08", 1), "2026-07-10")
+    end)
+
+    t.it("recusa uma data ou um estado que não existe", function()
+        t.not_nil(feriados.is_holiday("2026-02-30").message)
+        t.not_nil(feriados.is_holiday("30/12/2026").message)
+        t.not_nil(feriados.year(2026, {state = "XX"}).message)
+        t.not_nil(feriados.year(2026, {calendar = "lua"}).message)
+    end)
+end)

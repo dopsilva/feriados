@@ -1,0 +1,588 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- feriados — os feriados do Brasil: nacionais, estaduais (as 27 UFs),
+-- municipais (os da capital paulista, e os que você informar), os pontos
+-- facultativos e o calendário bancário; dias úteis, o próximo dia útil e a
+-- soma de dias úteis
+--
+--   local feriados = require("feriados")
+--   feriados.year(2026, {state = "SP"})            → [{date, name, kind, scope}]  ("2026-01-01", ...)
+--   feriados.holiday("2026-07-09", {state = "SP"}) → {date, name = "Revolução Constitucionalista", kind = "estadual", scope = "SP"}
+--   feriados.is_business_day("2026-02-17", {calendar = "bank"})   → false (Carnaval)
+--   feriados.next_business_day("2026-04-03")      → "2026-04-06" (Sexta-feira Santa, sábado, domingo)
+--   feriados.add_business_days("2026-12-23", 2)   → "2026-12-28"
+--   feriados.business_days_between("2026-01-01", "2026-01-31")    → 21
+--   local cal = feriados.calendar({state = "RJ"})  (guarda os anos já calculados: o mesmo, mais rápido)
+--   cal:is_business_day("2026-04-23")             → false (São Jorge)
+--
+-- As datas são texto "AAAA-MM-DD" (ou um Time de sea, lido pela data).
+--
+-- opts (todas opcionais):
+--   state     a UF ("SP") ou o nome do estado ("São Paulo"): os feriados estaduais
+--   city      "São Paulo" (a capital, com state SP): os feriados municipais conhecidos
+--   calendar  "civil" (padrão): os feriados que fecham o comércio e os serviços;
+--             "bank": o dos bancos (Resolução CMN 4.880/2020, o calendário da
+--             ANBIMA): os nacionais, mais a segunda e a terça de Carnaval e
+--             Corpus Christi
+--   optional  true: também os pontos facultativos (Carnaval, Quarta-feira de
+--             Cinzas, Corpus Christi, Dia do Servidor Público, as vésperas de
+--             Natal e de Ano-Novo) — no calendário civil
+--   extra     outros feriados (os do seu município, um dia de folga da
+--             empresa): [{date = "MM-DD" (todo ano) | "AAAA-MM-DD" (só aquele), name, since?, until?}]
+--             ou uma função (year) → [{date = "AAAA-MM-DD", name}]
+--
+-- kind: "nacional", "estadual", "municipal", "facultativo", "bancario" (só
+-- no calendário dos bancos) ou "extra". scope: "BR", a UF, a cidade ou "".
+--
+-- As regras e o histórico (desde 1890; os estaduais desde 1996, Lei
+-- 9.093/1995) vêm do pacote holidays (Python, MIT,
+-- https://github.com/vacanza/holidays), com as leis citadas no README.
+
+local M = {}
+
+-- ---- datas: AAAA-MM-DD ↔ número do dia (dias desde 1970-01-01) ----
+
+-- the day number of a civil date (H. Hinnant's days_from_civil)
+local function days_from(y, m, d)
+    if m <= 2 then y -= 1 end
+    local era = y // 400
+    local yoe = y - era * 400
+    local mp = (m + 9) % 12
+    local doy = (153 * mp + 2) // 5 + d - 1
+    local doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+end
+
+-- the civil date of a day number → y, m, d
+local function civil(n)
+    local z = n + 719468
+    local era = z // 146097
+    local doe = z - era * 146097
+    local yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    local y = yoe + era * 400
+    local doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    local mp = (5 * doy + 2) // 153
+    local d = doy - (153 * mp + 2) // 5 + 1
+    local m = mp < 10 and mp + 3 or mp - 9
+    if m <= 2 then y += 1 end
+    return y, m, d
+end
+
+local function text(n)
+    local y, m, d = civil(n)
+    return string.format("%04d-%02d-%02d", y, m, d)
+end
+
+-- 0 = domingo … 6 = sábado
+local function weekday(n)
+    return (n + 4) % 7
+end
+
+-- "AAAA-MM-DD" or a Time → day number | error
+local function day_of(v)
+    if type(v) ~= "string" then
+        if v ~= nil and v.format ~= nil then v = v:format("2006-01-02") else return error("feriados: a date is \"AAAA-MM-DD\"") end
+    end
+    local m = re.match("^(\\d{4})-(\\d{2})-(\\d{2})", v)
+    if m == nil then return error(`feriados: '${v}' is not a date (AAAA-MM-DD)`) end
+    local y = tonumber(m.groups[1])
+    local mo = tonumber(m.groups[2])
+    local d = tonumber(m.groups[3])
+    local n = days_from(y, mo, d)
+    local y2, m2, d2 = civil(n)
+    if y2 ~= y or m2 ~= mo or d2 ~= d then return error(`feriados: '${v}' does not exist`) end
+    return n
+end
+
+-- feriados.easter(year) → "AAAA-MM-DD": o domingo de Páscoa (gregoriano, algoritmo de Meeus/Jones/Butcher)
+local function easter_day(y)
+    local a = y % 19
+    local b = y // 100
+    local c = y % 100
+    local d = b // 4
+    local e = b % 4
+    local f = (b + 8) // 25
+    local g = (b - f + 1) // 3
+    local h = (19 * a + b - d - g + 15) % 30
+    local i = c // 4
+    local k = c % 4
+    local l = (32 + 2 * e + 2 * i - h - k) % 7
+    local m = (a + 11 * h + 22 * l) // 451
+    local month = (h + l - 7 * m + 114) // 31
+    local day = (h + l - 7 * m + 114) % 31 + 1
+    return days_from(y, month, day)
+end
+
+function M.easter(year)
+    return text(easter_day(year))
+end
+
+-- ---- as UFs ----
+
+M.STATES = {
+    AC = "Acre", AL = "Alagoas", AM = "Amazonas", AP = "Amapá", BA = "Bahia", CE = "Ceará", DF = "Distrito Federal",
+    ES = "Espírito Santo", GO = "Goiás", MA = "Maranhão", MG = "Minas Gerais", MS = "Mato Grosso do Sul",
+    MT = "Mato Grosso", PA = "Pará", PB = "Paraíba", PE = "Pernambuco", PI = "Piauí", PR = "Paraná",
+    RJ = "Rio de Janeiro", RN = "Rio Grande do Norte", RO = "Rondônia", RR = "Roraima", RS = "Rio Grande do Sul",
+    SC = "Santa Catarina", SE = "Sergipe", SP = "São Paulo", TO = "Tocantins",
+}
+
+local function plain(s)
+    return utf8.lower(string.trim(s))
+end
+
+-- the UF of opts.state ("SP", "sp", "São Paulo") → "SP" | nil | error
+local function state_of(s)
+    if s == nil or s == "" then return nil end
+    local up = string.upper(string.trim(s))
+    if M.STATES[up] ~= nil then return up end
+    local low = plain(s)
+    for uf, name in M.STATES do
+        if plain(name) == low then return uf end
+    end
+    return error(`feriados: unknown state '${s}'`)
+end
+
+-- ---- as regras de um ano ----
+
+-- the first Sunday on or after a day
+local function sunday_from(n)
+    return n + (7 - weekday(n)) % 7
+end
+
+-- Acre (since 2009): a holiday on a Tuesday, Wednesday or Thursday moves to that week's Friday
+local function acre_moved(y, n)
+    if y < 2009 then return n end
+    local w = weekday(n)
+    if w >= 2 and w <= 4 then return n + (5 - w) end
+    return n
+end
+
+local function national(y, add)
+    local e = easter_day(y)
+    local D = function(m, d) return days_from(y, m, d) end
+    add(D(1, 1), "Confraternização Universal")
+    if y >= 1892 and y <= 1930 then add(D(2, 24), "Constituição da República") end
+    add(e - 2, "Sexta-feira Santa")
+    if y ~= 1931 and y ~= 1932 then add(D(4, 21), "Tiradentes") end
+    if y >= 1925 then add(D(5, 1), "Dia do Trabalhador") end
+    if y <= 1930 or (y >= 1936 and y <= 1948) then add(D(5, 3), "Descobrimento do Brasil") end
+    if y <= 1930 then
+        add(D(5, 13), "Abolição da escravidão no Brasil")
+        add(D(7, 14), "Liberdade e Independência dos Povos Americanos")
+    end
+    add(D(9, 7), "Independência do Brasil")
+    if y <= 1930 or (y >= 1936 and y <= 1948) then add(D(10, 12), "Descobrimento da América") end
+    if y >= 1980 then add(D(10, 12), "Nossa Senhora Aparecida") end
+    add(D(11, 2), "Finados")
+    add(D(11, 15), "Proclamação da República")
+    if y >= 2024 then add(D(11, 20), "Dia Nacional de Zumbi e da Consciência Negra") end
+    if y >= 1922 then add(D(12, 25), "Natal") end
+end
+
+-- the pontos facultativos (the federal government's)
+local function optional(y, add)
+    local e = easter_day(y)
+    local D = function(m, d) return days_from(y, m, d) end
+    add(e - 48, "Carnaval")
+    add(e - 47, "Carnaval")
+    add(e - 46, "Quarta-feira de Cinzas")
+    add(e + 60, "Corpus Christi")
+    add(D(10, 28), "Dia do Servidor Público")
+    add(D(12, 24), "Véspera de Natal")
+    add(D(12, 31), "Véspera de Ano-Novo")
+end
+
+-- the banks' calendar, besides the national holidays
+local function bank(y, add)
+    local e = easter_day(y)
+    add(e - 48, "Carnaval")
+    add(e - 47, "Carnaval")
+    add(e + 60, "Corpus Christi")
+end
+
+local STATE_RULES = {}
+
+STATE_RULES.AC = function(y, add, D, e)
+    if y >= 2005 then add(acre_moved(y, D(1, 23)), "Dia do Evangélico") end
+    if y >= 2002 then add(acre_moved(y, D(3, 8)), "Dia Internacional da Mulher") end
+    add(D(6, 15), "Aniversário do Acre")
+    if y >= 2004 then add(acre_moved(y, D(9, 5)), "Dia da Amazônia") end
+    add(acre_moved(y, D(11, 17)), "Assinatura do Tratado de Petrópolis")
+end
+STATE_RULES.AL = function(y, add, D, e)
+    add(D(6, 24), "São João")
+    add(D(6, 29), "São Pedro")
+    add(D(9, 16), "Emancipação Política de Alagoas")
+    if y <= 2023 then add(D(11, 20), "Consciência Negra") end
+    if y >= 2013 then add(D(11, 30), "Dia do Evangélico") end
+end
+STATE_RULES.AM = function(y, add, D, e)
+    add(D(9, 5), "Elevação do Amazonas à categoria de província")
+    if y >= 2010 and y <= 2023 then add(D(11, 20), "Consciência Negra") end
+end
+STATE_RULES.AP = function(y, add, D, e)
+    if y >= 2003 then add(D(3, 19), "São José") end
+    if y >= 2012 then add(D(7, 25), "São Tiago") end
+    add(D(9, 13), "Criação do Território Federal")
+    if y >= 2008 and y <= 2023 then add(D(11, 20), "Consciência Negra") end
+end
+STATE_RULES.BA = function(y, add, D, e)
+    add(D(7, 2), "Independência da Bahia")
+end
+STATE_RULES.CE = function(y, add, D, e)
+    add(D(3, 19), "São José")
+    add(D(3, 25), "Abolição da escravidão no Ceará")
+    if y >= 2004 then add(D(8, 15), "Nossa Senhora da Assunção") end
+end
+STATE_RULES.DF = function(y, add, D, e)
+    add(D(4, 21), "Fundação de Brasília")
+    add(D(11, 30), "Dia do Evangélico")
+end
+STATE_RULES.ES = function(y, add, D, e)
+    if y >= 2020 then add(e + 8, "Nossa Senhora da Penha") end
+end
+STATE_RULES.GO = function(y, add, D, e)
+    add(D(7, 26), "Fundação da cidade de Goiás")
+    add(D(10, 24), "Pedra fundamental de Goiânia")
+end
+STATE_RULES.MA = function(y, add, D, e)
+    add(D(7, 28), "Adesão do Maranhão à independência do Brasil")
+end
+STATE_RULES.MG = function(y, add, D, e)
+    add(D(4, 21), "Execução de Tiradentes")
+end
+STATE_RULES.MS = function(y, add, D, e)
+    add(D(10, 11), "Criação do Estado")
+end
+STATE_RULES.MT = function(y, add, D, e)
+    if y >= 2003 and y <= 2023 then add(D(11, 20), "Consciência Negra") end
+end
+STATE_RULES.PA = function(y, add, D, e)
+    add(D(8, 15), "Adesão do Grão-Pará à independência do Brasil")
+end
+STATE_RULES.PB = function(y, add, D, e)
+    add(D(8, 5), "Fundação do Estado")
+end
+STATE_RULES.PE = function(y, add, D, e)
+    if y >= 2018 then
+        add(D(3, 6), "Revolução Pernambucana de 1817")
+    elseif y >= 2008 then
+        add(sunday_from(D(3, 1)), "Revolução Pernambucana de 1817")
+    end
+end
+STATE_RULES.PI = function(y, add, D, e)
+    add(D(10, 19), "Dia do Piauí")
+end
+STATE_RULES.PR = function(y, add, D, e)
+    if y >= 2014 then add(D(11, 15), "Nossa Senhora do Rocio") else add(D(12, 19), "Emancipação do Paraná") end
+end
+STATE_RULES.RJ = function(y, add, D, e)
+    if y >= 2009 then add(e - 47, "Carnaval") end
+    if y >= 2008 then add(D(4, 23), "São Jorge") end
+    if y >= 2002 and y <= 2023 then add(D(11, 20), "Consciência Negra") end
+end
+STATE_RULES.RN = function(y, add, D, e)
+    if y >= 2000 then add(D(8, 7), "Dia do Rio Grande do Norte") end
+    if y >= 2007 then add(D(10, 3), "Mártires de Cunhaú e Uruaçu") end
+end
+STATE_RULES.RO = function(y, add, D, e)
+    add(D(1, 4), "Criação do Estado")
+    if y >= 2002 then add(D(6, 18), "Dia do Evangélico") end
+end
+STATE_RULES.RR = function(y, add, D, e)
+    add(D(10, 5), "Criação do Estado")
+end
+STATE_RULES.RS = function(y, add, D, e)
+    add(D(9, 20), "Dia do Gaúcho")
+end
+STATE_RULES.SC = function(y, add, D, e)
+    if y >= 2005 then
+        add(sunday_from(D(8, 11)), "Dia do Estado de Santa Catarina")
+    elseif y >= 2004 then
+        add(D(8, 11), "Dia do Estado de Santa Catarina")
+    end
+    if y >= 1999 and y ~= 2004 then
+        add(sunday_from(D(11, 25)), "Dia de Santa Catarina de Alexandria")
+    else
+        add(D(11, 25), "Dia de Santa Catarina de Alexandria")
+    end
+end
+STATE_RULES.SE = function(y, add, D, e)
+    add(D(7, 8), "Emancipação política de Sergipe")
+end
+STATE_RULES.SP = function(y, add, D, e)
+    if y >= 1997 then add(D(7, 9), "Revolução Constitucionalista") end
+end
+STATE_RULES.TO = function(y, add, D, e)
+    if y >= 1998 then add(D(3, 18), "Dia da Autonomia") end
+    add(D(9, 8), "Nossa Senhora da Natividade")
+    add(D(10, 5), "Criação do Estado")
+end
+
+-- the cities known here: {state, rules}
+local CITIES = {}
+CITIES["são paulo"] = {
+    state = "SP",
+    rules = function(y, add, D, e)
+        if y >= 1968 then
+            add(D(1, 25), "Aniversário da Cidade de São Paulo")
+            add(e + 60, "Corpus Christi")
+        end
+        if y >= 2004 and y <= 2023 then add(D(11, 20), "Consciência Negra") end
+    end,
+}
+
+-- feriados.cities() → ["São Paulo"]: as cidades com feriados municipais nesta biblioteca
+function M.cities()
+    return ["São Paulo"]
+end
+
+local function extra_list(y, extra, add)
+    if extra == nil then return true end
+    if type(extra) == "function" then
+        for _, h in extra(y) or [] do add(day_of(h.date)?, h.name or "Feriado") end
+        return true
+    end
+    for _, h in extra do
+        if (h.since == nil or y >= h.since) and (h.until == nil or y <= h.until) then
+            local mm = re.match("^(\\d{2})-(\\d{2})$", h.date or "")
+            if mm ~= nil then
+                add(days_from(y, tonumber(mm.groups[1]), tonumber(mm.groups[2])), h.name or "Feriado")
+            else
+                local n = day_of(h.date)?
+                local yy, _, _ = civil(n)
+                if yy == y then add(n, h.name or "Feriado") end
+            end
+        end
+    end
+    return true
+end
+
+-- the options checked once
+local function settings(opts)
+    opts = opts or {}
+    local s = {}
+    s.state = state_of(opts.state)?
+    s.calendar = opts.calendar or "civil"
+    if s.calendar ~= "civil" and s.calendar ~= "bank" then return error(`feriados: calendar is "civil" or "bank"`) end
+    s.optional = opts.optional == true
+    s.extra = opts.extra
+    if opts.city ~= nil and opts.city ~= "" then
+        local c = CITIES[plain(opts.city)]
+        if c == nil then
+            return error(`feriados: no city holidays for '${opts.city}' here (give them in extra)`)
+        end
+        if s.state ~= nil and s.state ~= c.state then return error(`feriados: ${opts.city} is not in ${s.state}`) end
+        s.state = c.state
+        s.city = opts.city
+        s.city_rules = c.rules
+    end
+    return s
+end
+
+-- the year's holidays → [{date, name, kind, scope, n}] by date (a day may have more than one)
+local function build(y, s)
+    local out = []
+    local function adder(kind, scope)
+        return function(n, name)
+            local h = {}
+            h.n = n
+            h.date = text(n)
+            h.name = name
+            h.kind = kind
+            h.scope = scope
+            out[] = h
+        end
+    end
+    national(y, adder("nacional", "BR"))
+    if s.calendar == "bank" then
+        bank(y, adder("bancario", "BR"))
+    elseif s.optional then
+        optional(y, adder("facultativo", "BR"))
+    end
+    local e = easter_day(y)
+    local D = function(m, d) return days_from(y, m, d) end
+    -- the states' own holidays: since Lei 9.093/1995 (the capital of São Paulo's, since 1968)
+    -- (a known city's state holidays apply with it, whatever the year: the rules have their own)
+    if s.state ~= nil and (y >= 1996 or s.city_rules ~= nil) then STATE_RULES[s.state](y, adder("estadual", s.state), D, e) end
+    if s.city_rules ~= nil then
+        s.city_rules(y, adder("municipal", s.city), D, e)
+    end
+    extra_list(y, s.extra, adder("extra", ""))?
+    sort.by(out, function(h) return [h.n, h.kind == "nacional" and 0 or 1, h.name] end)
+    return out
+end
+
+local function public(h)
+    local o = {}
+    o.date = h.date
+    o.name = h.name
+    o.kind = h.kind
+    o.scope = h.scope
+    return o
+end
+
+-- ---- o calendário ----
+
+local Calendar = {}
+
+-- feriados.calendar([opts]) → calendar | error: as funções abaixo, com os anos guardados
+function M.calendar(opts)
+    local c = {}
+    c.settings = settings(opts)?
+    c.years = {} -- year → {holidays, days = {n → [holiday]}}
+    c.mu = sync.mutex()
+    for k, f in Calendar do c[k] = f end
+    return c
+end
+
+local function year_of(c, y)
+    c.mu:acquire()
+    defer c.mu:release()
+    local got = c.years[y]
+    if got ~= nil then return got end
+    local list_ = build(y, c.settings)?
+    local days = {}
+    for _, h in list_ do
+        if days[h.n] == nil then days[h.n] = [] end
+        days[h.n][] = h
+    end
+    got = {holidays = list_, days = days}
+    c.years[y] = got
+    return got
+end
+
+-- the holidays of a day number (the day's own, [] when none)
+local function on(c, n)
+    local y, _, _ = civil(n)
+    local yr = year_of(c, y)?
+    return yr.days[n] or []
+end
+
+-- cal:year(year) → [{date, name, kind, scope}]
+function Calendar.year(c, y)
+    local yr = year_of(c, y)?
+    return list.map(yr.holidays, public)
+end
+
+-- cal:holidays(date) → [{date, name, kind, scope}]: todos os do dia (um dia pode ter mais de um)
+function Calendar.holidays(c, date)
+    return list.map(on(c, day_of(date)?)?, public)
+end
+
+-- cal:holiday(date) → {date, name, kind, scope} | nil: o do dia (o nacional primeiro)
+function Calendar.holiday(c, date)
+    local hs = on(c, day_of(date)?)?
+    if len(hs) == 0 then return nil end
+    return public(hs[0])
+end
+
+-- cal:is_holiday(date) → bool
+function Calendar.is_holiday(c, date)
+    return len(on(c, day_of(date)?)?) > 0
+end
+
+local function business(c, n)
+    local w = weekday(n)
+    if w == 0 or w == 6 then return false end
+    return len(on(c, n)?) == 0
+end
+
+-- cal:is_business_day(date) → bool: de segunda a sexta, sem feriado
+function Calendar.is_business_day(c, date)
+    return business(c, day_of(date)?)
+end
+
+local MAX_STEPS = 3660
+
+-- cal:next_business_day(date) → date: o próprio dia, se útil; senão, o próximo
+function Calendar.next_business_day(c, date)
+    local n = day_of(date)?
+    for _ = 1, MAX_STEPS do
+        if business(c, n)? then return text(n) end
+        n += 1
+    end
+    return error("feriados: no business day in ten years")
+end
+
+-- cal:previous_business_day(date) → date: o próprio dia, se útil; senão, o anterior
+function Calendar.previous_business_day(c, date)
+    local n = day_of(date)?
+    for _ = 1, MAX_STEPS do
+        if business(c, n)? then return text(n) end
+        n -= 1
+    end
+    return error("feriados: no business day in ten years")
+end
+
+-- cal:add_business_days(date, n) → date: n dias úteis depois (antes, se n < 0); 0: o próprio dia
+function Calendar.add_business_days(c, date, count)
+    local n = day_of(date)?
+    local step = count < 0 and -1 or 1
+    local left = math.abs(count)
+    local guard = 0
+    while left > 0 do
+        n += step
+        if business(c, n)? then left -= 1 end
+        guard += 1
+        if guard > MAX_STEPS * 10 then return error("feriados: too many days") end
+    end
+    return text(n)
+end
+
+-- cal:business_days_between(from, to) → int: os dias úteis depois de from até to, inclusive
+-- (de segunda a sexta da mesma semana: 4); negativo se to vem antes
+function Calendar.business_days_between(c, from, to)
+    local a = day_of(from)?
+    local b = day_of(to)?
+    local sign = 1
+    if b < a then
+        local t = a
+        a = b
+        b = t
+        sign = -1
+    end
+    local count = 0
+    for n = a + 1, b do
+        if business(c, n)? then count += 1 end
+    end
+    return sign * count
+end
+
+-- ---- as mesmas, sem guardar um calendário: feriados.year(2026, opts), ... ----
+
+local cache = {}
+local cache_mu = sync.mutex()
+
+-- the calendar of these opts: plain opts (no extra function) are kept
+local function calendar_for(opts)
+    if opts ~= nil and type(opts.extra) == "function" then return M.calendar(opts) end
+    local key = json.encode(opts or {})
+    cache_mu:acquire()
+    defer cache_mu:release()
+    local c = cache[key]
+    if c == nil then
+        c = M.calendar(opts)?
+        cache[key] = c
+    end
+    return c
+end
+
+function M.year(y, opts) return calendar_for(opts)?:year(y) end
+function M.holidays(date, opts) return calendar_for(opts)?:holidays(date) end
+function M.holiday(date, opts) return calendar_for(opts)?:holiday(date) end
+function M.is_holiday(date, opts) return calendar_for(opts)?:is_holiday(date) end
+function M.is_business_day(date, opts) return calendar_for(opts)?:is_business_day(date) end
+function M.next_business_day(date, opts) return calendar_for(opts)?:next_business_day(date) end
+function M.previous_business_day(date, opts) return calendar_for(opts)?:previous_business_day(date) end
+function M.add_business_days(date, n, opts) return calendar_for(opts)?:add_business_days(date, n) end
+function M.business_days_between(from, to, opts) return calendar_for(opts)?:business_days_between(from, to) end
+
+-- feriados.weekday(date) → 0 (domingo) … 6 (sábado)
+function M.weekday(date)
+    return weekday(day_of(date)?)
+end
+
+return M
